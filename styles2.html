@@ -1,0 +1,2193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Style Snaps - Professional Background Library</title>
+    
+    <!-- Firebase SDK v10.12.3 (Updated) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-app.js";
+        import { getAuth, signInWithPopup, GoogleAuthProvider, signOut, onAuthStateChanged, signInWithCustomToken, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-auth.js";
+        import { getFirestore, doc, setDoc, updateDoc, onSnapshot, collection, increment, getDocs, addDoc, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-firestore.js";
+        
+        // Log all debug messages to the console
+        setLogLevel('debug');
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = {
+            apiKey: "AIzaSyBsozOdfTJX-uDnnCg8NL8Nq_-y2i9vuHE",
+            authDomain: "style-snaps.firebaseapp.com",
+            projectId: "style-snaps",
+            storageBucket: "style-snaps.firebasestorage.app",
+            messagingSenderId: "657144892159",
+            appId: "1:657144892159:web:9d2483f70bd1cb6fac9aca",
+            measurementId: "G-XD4FRYQ398"
+        };
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Initialize Firebase services
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        let currentUser = null;
+        let authStateReady = false;
+        let analyticsListeners = [];
+
+        // Firebase-connected functions
+        async function signInWithGoogle() {
+            const signInBtn = document.getElementById('sign-in-btn');
+            signInBtn.innerHTML = '<div class="spinner"></div> Signing in...';
+            signInBtn.disabled = true;
+
+            const provider = new GoogleAuthProvider();
+            try {
+                await signInWithPopup(auth, provider);
+                showToast("Welcome! You've signed in successfully.", "success");
+            } catch (error) {
+                console.error("Error signing in with Google:", error);
+                
+                // IMPORTANT: The "auth/unauthorized-domain" error means you need to add your app's domain
+                // to the list of authorized domains in your Firebase Console under Authentication -> Settings.
+                if (error.code === 'auth/unauthorized-domain') {
+                    showToast("Error: Unauthorized domain. Please add this domain to your Firebase settings.", "error");
+                } else {
+                    showToast("Error signing in. Please try again.", "error");
+                }
+                
+                // Reset button on failure
+                signInBtn.innerHTML = '<span>🚀</span> Sign In with Google';
+                signInBtn.disabled = false;
+            }
+        }
+
+        async function signOutUser() {
+            try {
+                await signOut(auth);
+                showToast("You've been signed out.", "success");
+            } catch (error) {
+                console.error("Error signing out:", error);
+                showToast("Error signing out.", "error");
+            }
+        }
+
+        async function logUserSignIn(user) {
+            try {
+                // Log user details to a private document
+                const userRef = doc(db, `/artifacts/${appId}/users/${user.uid}/profile/details`);
+                const userData = {
+                    name: user.displayName || 'Anonymous User',
+                    email: user.email || null,
+                    avatar: user.photoURL || `https://placehold.co/36x36/8b5cf6/ffffff?text=${(user.displayName || 'A')[0].toUpperCase()}`,
+                    lastSignIn: new Date().toISOString(),
+                    uid: user.uid
+                };
+                await setDoc(userRef, userData, { merge: true });
+                console.log("User sign-in logged:", user.uid);
+            
+                // Update public analytics data
+                const statsRef = doc(db, `/artifacts/${appId}/public/data/analytics_stats/stats`);
+                const statsSnap = await getDoc(statsRef);
+                if (!statsSnap.exists()) {
+                    await setDoc(statsRef, { totalUsers: 0, activeToday: 0, totalDownloads: 0 });
+                }
+
+                // Check if user is new to avoid incrementing totalUsers on every sign-in
+                const isNewUserRef = doc(db, `/artifacts/${appId}/public/data/user_ids/${user.uid}`);
+                const isNewUserSnap = await getDoc(isNewUserRef);
+                const incrementUser = isNewUserSnap.exists() ? 0 : 1;
+                await setDoc(isNewUserRef, { uid: user.uid }, { merge: true });
+
+                const now = new Date();
+                const todayRef = doc(db, `/artifacts/${appId}/public/data/analytics_active_today/${now.toISOString().split('T')[0]}`);
+                await setDoc(todayRef, { count: increment(1) }, { merge: true });
+                
+                await updateDoc(statsRef, {
+                    totalUsers: increment(incrementUser),
+                });
+
+                // Log recent sign-in to a public collection for display
+                const recentUsersRef = doc(db, `/artifacts/${appId}/public/data/analytics_recent_sign_ins/${user.uid}`);
+                const publicUserData = {
+                    name: user.displayName || 'Anonymous User',
+                    avatar: user.photoURL || `https://placehold.co/36x36/8b5cf6/ffffff?text=${(user.displayName || 'A')[0].toUpperCase()}`,
+                    lastSignIn: new Date().toISOString(),
+                };
+                await setDoc(recentUsersRef, publicUserData, { merge: true });
+
+            } catch (error) {
+                console.error("Error logging user sign-in:", error);
+            }
+        }
+        
+        async function logCodeDownload(snippetId, snippetName) {
+            try {
+                const downloadData = {
+                    userId: currentUser?.uid || 'anonymous',
+                    snippetId: snippetId,
+                    snippetName: snippetName,
+                    timestamp: new Date().toISOString(),
+                };
+                
+                const downloadsCollectionRef = collection(db, `/artifacts/${appId}/public/data/downloads`);
+                await addDoc(downloadsCollectionRef, downloadData);
+                console.log("Download logged:", downloadData);
+                
+                // Increment total downloads in the public stats document
+                const statsRef = doc(db, `/artifacts/${appId}/public/data/analytics_stats/stats`);
+                await updateDoc(statsRef, {
+                    totalDownloads: increment(1)
+                });
+                
+            } catch (error) {
+                console.error("Error logging download:", error);
+            }
+        }
+
+        // Live analytics listeners
+        function setupAnalyticsListeners() {
+            analyticsListeners.forEach(unsubscribe => unsubscribe());
+            analyticsListeners = [];
+            
+            // Listen to public stats document
+            const statsRef = doc(db, `/artifacts/${appId}/public/data/analytics_stats/stats`);
+            analyticsListeners.push(onSnapshot(statsRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    document.getElementById('total-users').textContent = (data.totalUsers || 0).toLocaleString();
+                    document.getElementById('total-downloads').textContent = (data.totalDownloads || 0).toLocaleString();
+                    if (currentUser) {
+                        document.getElementById('admin-total-users').textContent = (data.totalUsers || 0).toLocaleString();
+                        document.getElementById('admin-total-downloads').textContent = (data.totalDownloads || 0).toLocaleString();
+                    }
+                }
+            }, (error) => {
+                console.error("Error listening to stats:", error);
+            }));
+
+            const today = new Date().toISOString().split('T')[0];
+            const activeTodayRef = doc(db, `/artifacts/${appId}/public/data/analytics_active_today/${today}`);
+            analyticsListeners.push(onSnapshot(activeTodayRef, (docSnap) => {
+                if (docSnap.exists() && currentUser) {
+                    const data = docSnap.data();
+                    document.getElementById('admin-active-today').textContent = (data.count || 0).toLocaleString();
+                }
+            }, (error) => {
+                console.error("Error listening to active users:", error);
+            }));
+
+            // Listen to recent sign-ins
+            const recentUsersCollectionRef = collection(db, `/artifacts/${appId}/public/data/analytics_recent_sign_ins`);
+            analyticsListeners.push(onSnapshot(recentUsersCollectionRef, (snapshot) => {
+                const recentUsers = [];
+                snapshot.forEach(doc => {
+                    recentUsers.push(doc.data());
+                });
+                recentUsers.sort((a, b) => new Date(b.lastSignIn) - new Date(a.lastSignIn));
+                if (currentUser) {
+                    updateRecentUsersList(recentUsers);
+                }
+            }, (error) => {
+                console.error("Error listening to recent users:", error);
+            }));
+        }
+        
+        function updateRecentUsersList(users) {
+            const recentUsersList = document.getElementById('recent-users-list');
+            if (!recentUsersList) return;
+            recentUsersList.innerHTML = '';
+            
+            users.slice(0, 10).forEach(user => {
+                const userItem = document.createElement('div');
+                userItem.className = 'user-item';
+                userItem.innerHTML = `
+                    <img src="${user.avatar}" alt="${user.name}">
+                    <div class="name">${user.name}</div>
+                    <div class="time">${new Date(user.lastSignIn).toLocaleTimeString()}</div>
+                `;
+                recentUsersList.appendChild(userItem);
+            });
+        }
+
+        // UI Updates
+        function updateUserInterface() {
+            const signInBtn = document.getElementById('sign-in-btn');
+            const userInfo = document.getElementById('user-info');
+            const protectedFeatures = document.querySelectorAll('.protected-feature');
+            
+            if (currentUser) {
+                signInBtn.style.display = 'none';
+                userInfo.style.display = 'flex';
+                document.getElementById('user-name').textContent = currentUser.displayName || 'Anonymous User';
+                document.getElementById('user-avatar').src = currentUser.photoURL || `https://placehold.co/36x36/8b5cf6/ffffff?text=${(currentUser.displayName || 'A')[0].toUpperCase()}`;
+                protectedFeatures.forEach(feature => {
+                    feature.classList.remove('protected-feature');
+                });
+                updateAdminPanel(true);
+            } else {
+                signInBtn.style.display = 'flex';
+                signInBtn.innerHTML = '<span>🚀</span> Sign In with Google';
+                signInBtn.disabled = false;
+                userInfo.style.display = 'none';
+                protectedFeatures.forEach(feature => {
+                    feature.classList.add('protected-feature');
+                });
+                updateAdminPanel(false);
+            }
+        }
+        
+        function updateAdminPanel(isLoggedIn) {
+            const adminContent = document.getElementById('admin-content');
+            const adminLoading = document.getElementById('admin-loading');
+            const adminDenied = document.getElementById('admin-access-denied');
+            
+            adminLoading.style.display = 'none';
+            if (isLoggedIn) {
+                adminContent.style.display = 'block';
+                adminDenied.style.display = 'none';
+            } else {
+                adminContent.style.display = 'none';
+                adminDenied.style.display = 'block';
+            }
+        }
+
+        // --- Event Listeners and Initial Setup ---
+        window.onload = async function() {
+            createParticles();
+            
+            // Set up authentication listener
+            onAuthStateChanged(auth, async (user) => {
+                currentUser = user;
+                authStateReady = true;
+                updateUserInterface();
+                if (user) {
+                    await logUserSignIn(user);
+                }
+            });
+            
+            // Sign in with the provided custom token, or anonymously if none
+            if (initialAuthToken) {
+                try {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } catch (error) {
+                    console.error("Custom token sign-in failed:", error);
+                    // Fallback to anonymous sign-in
+                    try {
+                        await signInAnonymously(auth);
+                    } catch (anonError) {
+                        console.error("Anonymous sign-in failed:", anonError);
+                        // The 'auth/admin-restricted-operation' error means Anonymous Sign-in is not enabled in Firebase Console.
+                        // Go to Authentication > Settings > Enable Anonymous Authentication
+                        if (anonError.code === 'auth/admin-restricted-operation') {
+                            showToast("Error: Anonymous sign-in is not enabled. Please configure Firebase.", "error");
+                        }
+                    }
+                }
+            } else {
+                try {
+                    await signInAnonymously(auth);
+                } catch (error) {
+                    console.error("Anonymous sign-in failed:", error);
+                    if (error.code === 'auth/admin-restricted-operation') {
+                        showToast("Error: Anonymous sign-in is not enabled. Please configure Firebase.", "error");
+                    }
+                }
+            }
+            
+            setupAnalyticsListeners();
+        };
+
+        // --- Existing UI Functions (Updated for compatibility) ---
+        
+        // Create floating particles
+        function createParticles() {
+            const particlesContainer = document.getElementById('particles');
+            const particleCount = 15;
+            for (let i = 0; i < particleCount; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.left = Math.random() * 100 + '%';
+                particle.style.animationDelay = Math.random() * 20 + 's';
+                particle.style.animationDuration = (Math.random() * 10 + 15) + 's';
+                particlesContainer.appendChild(particle);
+            }
+        }
+
+        // Modal functions
+        function openModal(snippetId) {
+            const snippet = codeSnippets[snippetId];
+            const modal = document.getElementById('modal');
+            const titleText = document.getElementById('modal-title-text');
+            const body = document.getElementById('modal-body');
+
+            titleText.textContent = snippet.title;
+            body.innerHTML = `
+                <div class="code-section">
+                    <h4>🎨 CSS Styles</h4>
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span class="code-lang">CSS</span>
+                            <button class="copy-btn" onclick="copyCode('css-${snippetId}', '${snippet.title}')">
+                                <span>📋</span> Copy CSS
+                            </button>
+                        </div>
+                        <div class="code-content">
+                            <pre id="css-${snippetId}">${snippet.css}</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="code-section">
+                    <h4>📄 HTML Structure</h4>
+                    <div class="code-block">
+                        <div class="code-header">
+                            <span class="code-lang">HTML</span>
+                            <button class="copy-btn" onclick="copyCode('html-${snippetId}', '${snippet.title}')">
+                                <span>📋</span> Copy HTML
+                            </button>
+                        </div>
+                        <div class="code-content">
+                            <pre id="html-${snippetId}">${snippet.html}</pre>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            modal.style.display = 'flex';
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('modal');
+            modal.style.display = 'none';
+            document.body.style.overflow = 'auto';
+        }
+
+        // Preview functions
+        function previewFullscreen(className, title) {
+            const modal = document.getElementById('preview-modal');
+            const content = document.getElementById('preview-content');
+            const titleElement = document.getElementById('preview-title');
+            content.className = 'preview-content';
+            content.classList.add(className);
+            titleElement.textContent = title;
+            modal.style.display = 'flex';
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closePreview() {
+            const modal = document.getElementById('preview-modal');
+            modal.style.display = 'none';
+            document.body.style.overflow = 'auto';
+        }
+
+        // Copy function with analytics
+        function copyCode(elementId, snippetName) {
+            const element = document.getElementById(elementId);
+            const code = element.textContent;
+            
+            navigator.clipboard.writeText(code).then(() => {
+                logCodeDownload(elementId.replace(/^(css|html)-/, ''), snippetName);
+                showToast(`${snippetName} code copied!`, "success");
+            }).catch(err => {
+                console.error('Failed to copy: ', err);
+                showToast("Failed to copy code", "error");
+            });
+        }
+        
+        function showToast(message, type = "success") {
+            const toast = document.getElementById('toast');
+            const icon = type === "success" ? "✅" : type === "error" ? "❌" : "ℹ️";
+            toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+            const colors = {
+                success: 'linear-gradient(135deg, #22c55e, #16a34a)',
+                error: 'linear-gradient(135deg, #ef4444, #dc2626)',
+                info: 'linear-gradient(135deg, #3b82f6, #2563eb)'
+            };
+            toast.style.background = colors[type] || colors.success;
+            toast.classList.add('show');
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 3000);
+        }
+        
+        // Search function
+        function filterSnippets(searchTerm) {
+            const cards = document.querySelectorAll('.snippet-card');
+            const term = searchTerm.toLowerCase();
+            cards.forEach(card => {
+                const title = card.querySelector('.snippet-title').textContent.toLowerCase();
+                const description = card.querySelector('.snippet-description').textContent.toLowerCase();
+                const tags = card.getAttribute('data-tags').toLowerCase();
+                if (title.includes(term) || description.includes(term) || tags.includes(term) || term === '') {
+                    card.style.display = 'block';
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        }
+        
+        function toggleAdminPanel() {
+            const panel = document.getElementById('admin-panel');
+            panel.classList.toggle('open');
+        }
+
+        document.getElementById('modal').addEventListener('click', function(e) {
+            if (e.target === this) closeModal();
+        });
+        document.getElementById('preview-modal').addEventListener('click', function(e) {
+            if (e.target === this) closePreview();
+        });
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeModal();
+                closePreview();
+            }
+        });
+        
+        // Expose functions globally for HTML
+        window.signInWithGoogle = signInWithGoogle;
+        window.signOut = signOutUser;
+        window.openModal = openModal;
+        window.closeModal = closeModal;
+        window.previewFullscreen = previewFullscreen;
+        window.closePreview = closePreview;
+        window.copyCode = copyCode;
+        window.filterSnippets = filterSnippets;
+        window.toggleAdminPanel = toggleAdminPanel;
+        
+        // Code snippets object
+        const codeSnippets = {
+            gradient1: {
+                title: "Purple Dream",
+                css: `/* Purple Dream Background with Pulse Animation */
+.purple-dream {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    position: relative;
+    overflow: hidden;
+}
+
+.purple-dream::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 100px;
+    height: 100px;
+    background: radial-gradient(circle, rgba(255,255,255,0.2) 0%, transparent 70%);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    animation: pulse 3s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { 
+        transform: translate(-50%, -50%) scale(1); 
+        opacity: 0.5; 
+    }
+    50% { 
+        transform: translate(-50%, -50%) scale(1.5); 
+        opacity: 0.8; 
+    }
+}`,
+                html: `<!-- Purple Dream Background -->
+<div class="purple-dream">
+    <div class="content">
+        <h1>Your Content Here</h1>
+        <p>Beautiful content on gradient background</p>
+    </div>
+</div>`
+            },
+            gradient2: {
+                title: "Sunset Glow",
+                css: `/* Sunset Glow Background with Rotating Light */
+.sunset-glow {
+    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    min-height: 100vh;
+    position: relative;
+    overflow: hidden;
+}
+
+.sunset-glow::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: conic-gradient(from 0deg, transparent, rgba(255,255,255,0.1), transparent);
+    animation: rotate 8s linear infinite;
+}
+
+@keyframes rotate {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}`,
+                html: `<!-- Sunset Glow Background -->
+<div class="sunset-glow">
+    <div class="content">
+        <h1>Vibrant Design</h1>
+        <p>Content with sunset gradient</p>
+    </div>
+</div>`
+            },
+            gradient3: {
+                title: "Ocean Breeze",
+                css: `/* Ocean Breeze Background with Animated Stripes */
+.ocean-breeze {
+    background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+    min-height: 100vh;
+    position: relative;
+    overflow: hidden;
+}
+
+.ocean-breeze::after {
+    content: '';
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    background: repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 10px,
+        rgba(255,255,255,0.05) 10px,
+        rgba(255,255,255,0.05) 20px
+    );
+    animation: slide 4s linear infinite;
+}
+
+@keyframes slide {
+    0% { transform: translateX(-40px); }
+    100% { transform: translateX(40px); }
+}`,
+                html: `<!-- Ocean Breeze Background -->
+<div class="ocean-breeze">
+    <div class="content">
+        <h1>Clean & Professional</h1>
+        <p>Perfect for modern applications</p>
+    </div>
+</div>`
+            },
+            geometric: {
+                title: "Geometric Elegance",
+                css: `/* Geometric Elegance Background */
+.geometric-elegance {
+    background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+    min-height: 100vh;
+    position: relative;
+    overflow: hidden;
+}
+
+.geometric-elegance::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-image: 
+        radial-gradient(circle at 25% 25%, rgba(255,255,255,0.1) 0%, transparent 50%),
+        radial-gradient(circle at 75% 75%, rgba(255,255,255,0.1) 0%, transparent 50%);
+    animation: geometricFloat 6s ease-in-out infinite;
+}
+
+@keyframes geometricFloat {
+    0%, 100% { 
+        transform: translate(0, 0) scale(1); 
+        opacity: 0.7;
+    }
+    50% { 
+        transform: translate(10px, -10px) scale(1.05); 
+        opacity: 1;
+    }
+}`,
+                html: `<!-- Geometric Elegance Background -->
+<div class="geometric-elegance">
+    <div class="content">
+        <h1>Premium Design</h1>
+        <p>Sophisticated patterns</p>
+    </div>
+</div>`
+            },
+            mesh: {
+                title: "Tech Grid",
+                css: `/* Tech Grid Background */
+.tech-grid {
+    background: #0f0f0f;
+    background-image: radial-gradient(circle at 1px 1px, #404040 1px, transparent 0);
+    background-size: 20px 20px;
+    min-height: 100vh;
+    position: relative;
+    animation: meshMove 10s linear infinite;
+}
+
+@keyframes meshMove {
+    0% { background-position: 0 0; }
+    100% { background-position: 20px 20px; }
+}
+
+.mesh-bg::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+}`,
+                html: `<!-- Tech Grid Background -->
+<div class="tech-grid">
+    <div class="content">
+        <h1>Tech Interface</h1>
+        <p>Perfect for dashboards</p>
+    </div>
+</div>`
+            }
+        };
+
+        document.addEventListener('DOMContentLoaded', function() {
+            document.addEventListener('keydown', function(e) {
+                // Alt + A to toggle admin panel (for signed-in users)
+                if (e.altKey && e.key.toLowerCase() === 'a' && currentUser) {
+                    toggleAdminPanel();
+                }
+            });
+        });
+
+    </script>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .animated-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            background: linear-gradient(-45deg, #1a1a1a, #2d2d2d, #1e1e1e, #333333);
+            background-size: 400% 400%;
+            animation: gradientShift 15s ease infinite;
+        }
+
+        @keyframes gradientShift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        .floating-particles {
+            position: fixed;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+        }
+
+        .particle {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background: rgba(99, 102, 241, 0.3);
+            border-radius: 50%;
+            animation: float 20s infinite linear;
+        }
+
+        @keyframes float {
+            0% {
+                transform: translateY(100vh) rotate(0deg);
+                opacity: 0;
+            }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% {
+                transform: translateY(-100vh) rotate(360deg);
+                opacity: 0;
+            }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .header {
+            background: rgba(20, 20, 20, 0.95);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid #333;
+            padding: 20px 0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            border-bottom-left-radius: 20px;
+            border-bottom-right-radius: 20px;
+            margin: 0 20px;
+        }
+
+        .header-content {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .auth-section {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .user-info {
+            display: none;
+            align-items: center;
+            gap: 12px;
+            color: #e0e0e0;
+        }
+
+        .user-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: 2px solid #6366f1;
+        }
+
+        .user-name {
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .sign-in-btn {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 25px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sign-in-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+        }
+
+        .sign-out-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .sign-out-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .admin-panel {
+            position: fixed;
+            top: 100px;
+            right: -400px;
+            width: 350px;
+            height: calc(100vh - 120px);
+            background: rgba(20, 20, 20, 0.95);
+            backdrop-filter: blur(20px);
+            border: 1px solid #333;
+            border-radius: 16px 0 0 16px;
+            transition: right 0.4s ease;
+            z-index: 1500;
+            overflow-y: auto;
+        }
+
+        .admin-panel.open {
+            right: 0;
+        }
+
+        .admin-toggle {
+            position: absolute;
+            left: -50px;
+            top: 50px;
+            width: 50px;
+            height: 80px;
+            background: rgba(99, 102, 241, 0.9);
+            border: none;
+            border-radius: 8px 0 0 8px;
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            transition: all 0.3s ease;
+        }
+
+        .admin-toggle:hover {
+            background: rgba(99, 102, 241, 1);
+        }
+
+        .admin-content {
+            padding: 24px;
+        }
+
+        .admin-title {
+            color: white;
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .analytics-grid {
+            display: grid;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .analytics-card {
+            background: rgba(30, 30, 30, 0.8);
+            border: 1px solid #404040;
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .analytics-card h4 {
+            color: #6366f1;
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .analytics-number {
+            color: white;
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .analytics-label {
+            color: #a0a0a0;
+            font-size: 12px;
+        }
+
+        .recent-users {
+            margin-top: 24px;
+        }
+
+        .recent-users h4 {
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+
+        .user-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .user-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px;
+            background: rgba(30, 30, 30, 0.5);
+            border-radius: 8px;
+        }
+
+        .user-item img {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+        }
+
+        .user-item .name {
+            color: #e0e0e0;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .user-item .time {
+            color: #888;
+            font-size: 11px;
+            margin-left: auto;
+        }
+
+        .access-denied {
+            text-align: center;
+            color: #888;
+            font-style: italic;
+            margin-top: 100px;
+        }
+
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            color: #6366f1;
+            font-size: 14px;
+        }
+
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(99, 102, 241, 0.3);
+            border-top: 2px solid #6366f1;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .protected-feature {
+            opacity: 0.5;
+            pointer-events: none;
+            position: relative;
+        }
+
+        .protected-feature::after {
+            content: 'Sign in to access';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(99, 102, 241, 0.9);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .protected-feature:hover::after {
+            opacity: 1;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 28px;
+            font-weight: 800;
+            color: #ffffff;
+            animation: logoGlow 3s ease-in-out infinite;
+        }
+
+        @keyframes logoGlow {
+            0%, 100% { text-shadow: 0 0 10px rgba(99, 102, 241, 0.5); }
+            50% { text-shadow: 0 0 20px rgba(99, 102, 241, 0.8), 0 0 30px rgba(139, 92, 246, 0.4); }
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+            animation: iconSpin 10s linear infinite;
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.4);
+        }
+
+        @keyframes iconSpin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .nav-stats {
+            display: flex;
+            gap: 24px;
+            font-size: 14px;
+        }
+
+        .stat {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: #a0a0a0;
+        }
+
+        .stat-number {
+            font-size: 20px;
+            font-weight: 700;
+            color: #6366f1;
+            margin-bottom: 4px;
+        }
+
+        .main {
+            padding: 80px 0;
+        }
+
+        .hero {
+            text-align: center;
+            margin-bottom: 100px;
+            position: relative;
+        }
+
+        .hero-content {
+            animation: fadeInUp 1s ease-out;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .hero h1 {
+            font-size: 72px;
+            font-weight: 900;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, #ffffff, #6366f1, #8b5cf6, #a0a0a0);
+            background-size: 300% 300%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: textShimmer 4s ease-in-out infinite;
+            line-height: 1.1;
+        }
+
+        @keyframes textShimmer {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        .hero-subtitle {
+            font-size: 24px;
+            color: #a0a0a0;
+            margin-bottom: 16px;
+            font-weight: 300;
+        }
+
+        .hero p {
+            font-size: 18px;
+            color: #888;
+            max-width: 700px;
+            margin: 0 auto 40px;
+            line-height: 1.7;
+        }
+
+        .feature-highlights {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin: 60px 0;
+            flex-wrap: wrap;
+        }
+
+        .feature {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 16px 24px;
+            background: rgba(30, 30, 30, 0.6);
+            border: 1px solid #404040;
+            border-radius: 50px;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .feature:hover {
+            background: rgba(99, 102, 241, 0.1);
+            border-color: #6366f1;
+            transform: translateY(-2px);
+        }
+
+        .feature-icon {
+            font-size: 24px;
+        }
+
+        .feature-text {
+            font-weight: 500;
+            color: #e0e0e0;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 48px;
+            font-weight: 700;
+            margin-bottom: 16px;
+            color: #ffffff;
+        }
+
+        .section-description {
+            text-align: center;
+            font-size: 18px;
+            color: #a0a0a0;
+            margin-bottom: 60px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .search-container {
+            text-align: center;
+            margin: 40px 0;
+        }
+
+        .search-input {
+            padding: 12px 20px;
+            width: 300px;
+            border: 1px solid #444;
+            border-radius: 25px;
+            background: rgba(30, 30, 30, 0.8);
+            color: white;
+            font-size: 16px;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        .search-input:focus {
+            border-color: #6366f1;
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.2);
+        }
+
+        .snippets-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+            gap: 40px;
+            margin-bottom: 80px;
+        }
+
+        .snippet-card {
+            background: rgba(30, 30, 30, 0.4);
+            border: 1px solid #333;
+            border-radius: 24px;
+            overflow: hidden;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+            position: relative;
+            animation: cardSlideIn 0.6s ease-out forwards;
+            opacity: 0;
+            transform: translateY(30px);
+        }
+
+        .snippet-card:nth-child(1) { animation-delay: 0.1s; }
+        .snippet-card:nth-child(2) { animation-delay: 0.2s; }
+        .snippet-card:nth-child(3) { animation-delay: 0.3s; }
+        .snippet-card:nth-child(4) { animation-delay: 0.4s; }
+        .snippet-card:nth-child(5) { animation-delay: 0.5s; }
+
+        @keyframes cardSlideIn {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .snippet-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, #6366f1, transparent);
+            transform: translateX(-100%);
+            transition: transform 0.6s ease;
+        }
+
+        .snippet-card:hover::before {
+            transform: translateX(100%);
+        }
+
+        .snippet-card:hover {
+            transform: translateY(-8px) scale(1.02);
+            border-color: #6366f1;
+            box-shadow: 
+                0 25px 50px rgba(99, 102, 241, 0.15),
+                0 0 0 1px rgba(99, 102, 241, 0.2);
+        }
+
+        .preview-container {
+            height: 220px;
+            position: relative;
+            overflow: hidden;
+            border-bottom: 1px solid #333;
+        }
+
+        .preview {
+            width: 100%;
+            height: 100%;
+            transform: scale(0.5);
+            transform-origin: top left;
+            width: 200%;
+            height: 200%;
+            transition: transform 0.3s ease;
+        }
+
+        .snippet-card:hover .preview {
+            transform: scale(0.52);
+        }
+
+        .gradient-bg-1 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            position: relative;
+        }
+
+        .gradient-bg-1::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 100px;
+            height: 100px;
+            background: radial-gradient(circle, rgba(255,255,255,0.2) 0%, transparent 70%);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            animation: pulse 3s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.5; }
+            50% { transform: translate(-50%, -50%) scale(1.5); opacity: 0.8; }
+        }
+
+        .gradient-bg-2 {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .gradient-bg-2::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: conic-gradient(from 0deg, transparent, rgba(255,255,255,0.1), transparent);
+            animation: rotate 8s linear infinite;
+        }
+
+        @keyframes rotate {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .gradient-bg-3 {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            position: relative;
+        }
+
+        .gradient-bg-3::after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: repeating-linear-gradient(
+                45deg,
+                transparent,
+                transparent 10px,
+                rgba(255,255,255,0.05) 10px,
+                rgba(255,255,255,0.05) 20px
+            );
+            animation: slide 4s linear infinite;
+        }
+
+        @keyframes slide {
+            0% { transform: translateX(-40px); }
+            100% { transform: translateX(40px); }
+        }
+
+        .geometric-bg {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .geometric-bg::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-image: 
+                radial-gradient(circle at 25% 25%, rgba(255,255,255,0.1) 0%, transparent 50%),
+                radial-gradient(circle at 75% 75%, rgba(255,255,255,0.1) 0%, transparent 50%);
+            animation: geometricFloat 6s ease-in-out infinite;
+        }
+
+        @keyframes geometricFloat {
+            0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.7; }
+            50% { transform: translate(10px, -10px) scale(1.05); opacity: 1; }
+        }
+
+        .mesh-bg {
+            background: #0f0f0f;
+            background-image: radial-gradient(circle at 1px 1px, #404040 1px, transparent 0);
+            background-size: 20px 20px;
+            position: relative;
+            animation: meshMove 10s linear infinite;
+        }
+
+        @keyframes meshMove {
+            0% { background-position: 0 0; }
+            100% { background-position: 20px 20px; }
+        }
+
+        .mesh-bg::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
+        }
+
+        .card-content {
+            padding: 32px;
+        }
+
+        .snippet-title {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .snippet-badge {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .snippet-description {
+            color: #a0a0a0;
+            margin-bottom: 20px;
+            line-height: 1.6;
+            font-size: 15px;
+        }
+
+        .snippet-tags {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .tag {
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            color: #6366f1;
+            padding: 4px 12px;
+            border-radius: 16px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .snippet-stats {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+            font-size: 13px;
+            color: #888;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.6s ease;
+        }
+
+        .btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn-secondary {
+            background: rgba(50, 50, 50, 0.6);
+            color: #e0e0e0;
+            border: 1px solid #505050;
+            backdrop-filter: blur(10px);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(70, 70, 70, 0.8);
+            border-color: #6366f1;
+            transform: translateY(-1px);
+        }
+
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+            backdrop-filter: blur(10px);
+        }
+
+        .modal-content {
+            background: linear-gradient(135deg, #1a1a1a, #2d2d2d);
+            border: 1px solid #444;
+            border-radius: 24px;
+            padding: 0;
+            max-width: 800px;
+            width: 90%;
+            max-height: 90vh;
+            overflow: hidden;
+            box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
+            animation: modalSlideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        @keyframes modalSlideIn {
+            from {
+                opacity: 0;
+                transform: scale(0.9) translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: scale(1) translateY(0);
+            }
+        }
+
+        .modal-header {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            padding: 24px 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #444;
+        }
+
+        .modal-title {
+            font-size: 28px;
+            font-weight: 700;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .modal-body {
+            padding: 32px;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+
+        .code-section {
+            margin-bottom: 32px;
+        }
+
+        .code-section h4 {
+            color: #ffffff;
+            margin-bottom: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .code-block {
+            background: #0d0d0d;
+            border: 1px solid #333;
+            border-radius: 16px;
+            position: relative;
+            overflow: hidden;
+            margin-bottom: 16px;
+        }
+
+        .code-header {
+            background: #1a1a1a;
+            padding: 12px 20px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .code-lang {
+            color: #6366f1;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .code-content {
+            padding: 20px;
+            font-family: 'Fira Code', 'Monaco', 'Menlo', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            color: #e0e0e0;
+            overflow-x: auto;
+        }
+
+        .copy-btn {
+            background: rgba(99, 102, 241, 0.2);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: #6366f1;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .copy-btn:hover {
+            background: rgba(99, 102, 241, 0.3);
+            transform: translateY(-1px);
+        }
+
+        .copy-btn.copied {
+            background: rgba(34, 197, 94, 0.2);
+            border-color: rgba(34, 197, 94, 0.3);
+            color: #22c55e;
+        }
+
+        .close-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #ffffff;
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 18px;
+        }
+
+        .close-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: scale(1.1);
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+            color: white;
+            padding: 16px 24px;
+            border-radius: 16px;
+            font-size: 14px;
+            font-weight: 600;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 3000;
+            box-shadow: 0 10px 30px rgba(34, 197, 94, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .preview-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.95);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 3000;
+        }
+
+        .preview-content {
+            width: 90%;
+            height: 90%;
+            max-width: 1200px;
+            max-height: 800px;
+            border-radius: 20px;
+            overflow: hidden;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .preview-close {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            font-size: 24px;
+            cursor: pointer;
+            z-index: 10;
+            transition: all 0.3s ease;
+        }
+
+        .preview-close:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: scale(1.1);
+        }
+
+        .preview-text {
+            text-align: center;
+            color: white;
+            z-index: 5;
+            position: relative;
+        }
+
+        .preview-text h1 {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            text-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+
+        .preview-text p {
+            font-size: 1.5rem;
+            opacity: 0.9;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+        }
+
+        @media (max-width: 768px) {
+            .snippets-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .hero h1 {
+                font-size: 48px;
+            }
+            
+            .modal-content {
+                margin: 20px;
+                width: calc(100% - 40px);
+            }
+
+            .modal-body {
+                padding: 24px;
+            }
+
+            .feature-highlights {
+                gap: 16px;
+            }
+
+            .nav-stats {
+                display: none;
+            }
+
+            .search-input {
+                width: 280px;
+            }
+        }
+
+        .syntax-css { color: #61dafb; }
+        .syntax-property { color: #9cdcfe; }
+        .syntax-value { color: #ce9178; }
+        .syntax-comment { color: #6a9955; font-style: italic; }
+        .syntax-tag { color: #569cd6; }
+        .syntax-attribute { color: #9cdcfe; }
+        .syntax-string { color: #ce9178; }
+    </style>
+</head>
+<body>
+    <div class="animated-bg"></div>
+    <div class="floating-particles" id="particles"></div>
+
+    <header class="header">
+        <div class="container">
+            <div class="header-content">
+                <div>
+                    <div class="logo">
+                        <div class="logo-icon">SS</div>
+                        Style Snaps
+                    </div>
+                </div>
+                <div class="auth-section">
+                    <div class="nav-stats">
+                        <div class="stat">
+                            <div class="stat-number" id="total-users">0</div>
+                            <div>Users</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-number" id="total-downloads">0</div>
+                            <div>Downloads</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-number">4.9</div>
+                            <div>Rating</div>
+                        </div>
+                    </div>
+                    
+                    <div class="user-info" id="user-info">
+                        <img class="user-avatar" id="user-avatar" src="" alt="User">
+                        <div>
+                            <div class="user-name" id="user-name"></div>
+                            <button class="sign-out-btn" onclick="signOut()">Sign Out</button>
+                        </div>
+                    </div>
+                    
+                    <button class="sign-in-btn" id="sign-in-btn" onclick="signInWithGoogle()">
+                        <span>🚀</span> Sign In with Google
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+        <div class="container">
+            <div class="hero">
+                <div class="hero-content">
+                    <h1>Beautiful Backgrounds</h1>
+                    <div class="hero-subtitle">Copy-paste ready CSS backgrounds</div>
+                    <p>Transform your web projects with professionally crafted background designs. Each snippet is optimized for performance, tested across browsers, and includes detailed implementation guides.</p>
+                    
+                    <div class="feature-highlights">
+                        <div class="feature">
+                            <div class="feature-icon">⚡</div>
+                            <div class="feature-text">Lightning Fast</div>
+                        </div>
+                        <div class="feature">
+                            <div class="feature-icon">🎨</div>
+                            <div class="feature-text">Modern Design</div>
+                        </div>
+                        <div class="feature">
+                            <div class="feature-icon">📱</div>
+                            <div class="feature-text">Responsive</div>
+                        </div>
+                        <div class="feature">
+                            <div class="feature-icon">🔧</div>
+                            <div class="feature-text">Customizable</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <section>
+                <h2 class="section-title">Premium Background Collection</h2>
+                <p class="section-description">Handcrafted CSS backgrounds designed for modern web applications. Each background includes multiple variations and detailed customization options.</p>
+                
+                <div class="search-container">
+                    <input type="text" class="search-input" placeholder="Search backgrounds..." onkeyup="filterSnippets(this.value)">
+                </div>
+                
+                <div class="snippets-grid">
+                    <!-- Gradient Background 1 -->
+                    <div class="snippet-card" data-tags="gradient animated modern professional purple">
+                        <div class="preview-container">
+                            <div class="preview gradient-bg-1"></div>
+                        </div>
+                        <div class="card-content">
+                            <h3 class="snippet-title">
+                                Purple Dream
+                                <span class="snippet-badge">Popular</span>
+                            </h3>
+                            <p class="snippet-description">An elegant gradient transitioning from deep blue to rich purple with animated pulse effect. Perfect for modern web applications, landing pages, and creative portfolios.</p>
+                            
+                            <div class="snippet-tags">
+                                <span class="tag">Gradient</span>
+                                <span class="tag">Animated</span>
+                                <span class="tag">Modern</span>
+                                <span class="tag">Professional</span>
+                            </div>
+                            
+                            <div class="snippet-stats">
+                                <div class="stat-item">
+                                    <span>📊</span>
+                                    <span>3.2K uses</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>⭐</span>
+                                    <span>4.8/5</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>💾</span>
+                                    <span>2KB</span>
+                                </div>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-primary" onclick="openModal('gradient1')">
+                                    <span>📋</span> Get Code
+                                </button>
+                                <button class="btn btn-secondary" onclick="previewFullscreen('gradient-bg-1', 'Purple Dream')">
+                                    <span>👁️</span> Preview
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Gradient Background 2 -->
+                    <div class="snippet-card" data-tags="gradient vibrant creative rotating sunset">
+                        <div class="preview-container">
+                            <div class="preview gradient-bg-2"></div>
+                        </div>
+                        <div class="card-content">
+                            <h3 class="snippet-title">
+                                Sunset Glow
+                                <span class="snippet-badge">Trending</span>
+                            </h3>
+                            <p class="snippet-description">Vibrant pink to red gradient with rotating light effects reminiscent of a beautiful sunset. Ideal for creative agencies, art portfolios, and fashion brands.</p>
+                            
+                            <div class="snippet-tags">
+                                <span class="tag">Gradient</span>
+                                <span class="tag">Vibrant</span>
+                                <span class="tag">Creative</span>
+                                <span class="tag">Rotating</span>
+                            </div>
+                            
+                            <div class="snippet-stats">
+                                <div class="stat-item">
+                                    <span>📊</span>
+                                    <span>2.8K uses</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>⭐</span>
+                                    <span>4.9/5</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>💾</span>
+                                    <span>2.1KB</span>
+                                </div>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-primary" onclick="openModal('gradient2')">
+                                    <span>📋</span> Get Code
+                                </button>
+                                <button class="btn btn-secondary" onclick="previewFullscreen('gradient-bg-2', 'Sunset Glow')">
+                                    <span>👁️</span> Preview
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Gradient Background 3 -->
+                    <div class="snippet-card" data-tags="gradient clean professional animated blue">
+                        <div class="preview-container">
+                            <div class="preview gradient-bg-3"></div>
+                        </div>
+                        <div class="card-content">
+                            <h3 class="snippet-title">
+                                Ocean Breeze
+                                <span class="snippet-badge">Clean</span>
+                            </h3>
+                            <p class="snippet-description">Fresh blue gradient with animated diagonal stripes that evoke calm ocean waters. Perfect for clean, professional interfaces and SaaS applications.</p>
+                            
+                            <div class="snippet-tags">
+                                <span class="tag">Gradient</span>
+                                <span class="tag">Clean</span>
+                                <span class="tag">Professional</span>
+                                <span class="tag">Animated</span>
+                            </div>
+                            
+                            <div class="snippet-stats">
+                                <div class="stat-item">
+                                    <span>📊</span>
+                                    <span>4.1K uses</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>⭐</span>
+                                    <span>4.7/5</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>💾</span>
+                                    <span>1.9KB</span>
+                                </div>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-primary" onclick="openModal('gradient3')">
+                                    <span>📋</span> Get Code
+                                </button>
+                                <button class="btn btn-secondary" onclick="previewFullscreen('gradient-bg-3', 'Ocean Breeze')">
+                                    <span>👁️</span> Preview
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Geometric Background -->
+                    <div class="snippet-card" data-tags="geometric premium sophisticated floating elegant">
+                        <div class="preview-container">
+                            <div class="preview geometric-bg"></div>
+                        </div>
+                        <div class="card-content">
+                            <h3 class="snippet-title">
+                                Geometric Elegance
+                                <span class="snippet-badge">Premium</span>
+                            </h3>
+                            <p class="snippet-description">Sophisticated dark blue gradient with subtle floating geometric light patterns. Designed for premium applications, fintech, and luxury brands.</p>
+                            
+                            <div class="snippet-tags">
+                                <span class="tag">Geometric</span>
+                                <span class="tag">Premium</span>
+                                <span class="tag">Sophisticated</span>
+                                <span class="tag">Floating</span>
+                            </div>
+                            
+                            <div class="snippet-stats">
+                                <div class="stat-item">
+                                    <span>📊</span>
+                                    <span>1.9K uses</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>⭐</span>
+                                    <span>4.6/5</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>💾</span>
+                                    <span>2.3KB</span>
+                                </div>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-primary" onclick="openModal('geometric')">
+                                    <span>📋</span> Get Code
+                                </button>
+                                <button class="btn btn-secondary" onclick="previewFullscreen('geometric-bg', 'Geometric Elegance')">
+                                    <span>👁️</span> Preview
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Mesh Background -->
+                    <div class="snippet-card" data-tags="grid tech animated dashboard developer">
+                        <div class="preview-container">
+                            <div class="preview mesh-bg"></div>
+                        </div>
+                        <div class="card-content">
+                            <h3 class="snippet-title">
+                                Tech Grid
+                                <span class="snippet-badge">Developer</span>
+                            </h3>
+                            <p class="snippet-description">Modern animated dark grid pattern with subtle gradient overlay. Perfect for tech startups, development portfolios, and dashboard interfaces.</p>
+                            
+                            <div class="snippet-tags">
+                                <span class="tag">Grid</span>
+                                <span class="tag">Tech</span>
+                                <span class="tag">Animated</span>
+                                <span class="tag">Dashboard</span>
+                            </div>
+                            
+                            <div class="snippet-stats">
+                                <div class="stat-item">
+                                    <span>📊</span>
+                                    <span>3.7K uses</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>⭐</span>
+                                    <span>4.8/5</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span>💾</span>
+                                    <span>1.8KB</span>
+                                </div>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-primary" onclick="openModal('mesh')">
+                                    <span>📋</span> Get Code
+                                </button>
+                                <button class="btn btn-secondary" onclick="previewFullscreen('mesh-bg', 'Tech Grid')">
+                                    <span>👁️</span> Preview
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- Admin Panel -->
+    <div id="admin-panel" class="admin-panel">
+        <button class="admin-toggle" onclick="toggleAdminPanel()">📊</button>
+        <div class="admin-content">
+            <div class="admin-title">
+                <span>📊</span>
+                Analytics Dashboard
+            </div>
+            
+            <div id="admin-loading" class="loading">
+                <div class="spinner"></div>
+                Loading analytics...
+            </div>
+            
+            <div id="admin-access-denied" class="access-denied" style="display: none;">
+                <p>🔒 Sign in to view analytics</p>
+            </div>
+            
+            <div id="admin-content" style="display: none;">
+                <div class="analytics-grid">
+                    <div class="analytics-card">
+                        <h4>Total Users</h4>
+                        <div class="analytics-number" id="admin-total-users">0</div>
+                        <div class="analytics-label">Registered users</div>
+                    </div>
+                    
+                    <div class="analytics-card">
+                        <h4>Active Today</h4>
+                        <div class="analytics-number" id="admin-active-today">0</div>
+                        <div class="analytics-label">Users online today</div>
+                    </div>
+                    
+                    <div class="analytics-card">
+                        <h4>Total Downloads</h4>
+                        <div class="analytics-number" id="admin-total-downloads">0</div>
+                        <div class="analytics-label">Code snippets copied</div>
+                    </div>
+                    
+                    <div class="analytics-card">
+                        <h4>Popular Snippet</h4>
+                        <div class="analytics-number" id="popular-snippet">Purple Dream</div>
+                        <div class="analytics-label">Most downloaded</div>
+                    </div>
+                </div>
+                
+                <div class="recent-users">
+                    <h4>Recent Sign-ins</h4>
+                    <div class="user-list" id="recent-users-list">
+                        <!-- Recent users will be populated here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Code Modal -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title" class="modal-title">
+                    <span>🎨</span>
+                    <span id="modal-title-text">CSS Code</span>
+                </h3>
+                <button class="close-btn" onclick="closeModal()">×</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Code content will be inserted here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Preview Modal -->
+    <div id="preview-modal" class="preview-modal">
+        <button class="preview-close" onclick="closePreview()">×</button>
+        <div id="preview-content" class="preview-content">
+            <div class="preview-text">
+                <h1>Style Snaps</h1>
+                <p id="preview-title">Beautiful Background</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast">
+        <span>✅</span>
+        <span>Code copied to clipboard!</span>
+    </div>
+</body>
+</html>
